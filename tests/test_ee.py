@@ -1,12 +1,16 @@
 import pytest
-from fastmcp import Client
+from fastmcp import Client, FastMCP
 from dotenv import load_dotenv
 import json
 from pathlib import Path
 from test_utils import create_flow, create_test, create_app
 import time
 import os
+import sys
 import httpx
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+from tools.ee import register_ee_tools  # noqa: E402
 
 
 load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env", override=True)
@@ -281,6 +285,19 @@ async def test_manage_apps(kestra_client, cleanup):
     assert "updated" in response_json
 
     uid = response_json["uid"]
+
+    # Test case 1b: Re-creating an existing app updates the same app UID
+    # even when another app exists in the tenant.
+    await create_flow("app_newsletter_flow.yaml", client, cleanup)
+    other_app = await create_app("app_newsletter.yaml", client)
+    other_uid = other_app["uid"]
+    try:
+        updated_app = await create_app("app_get_data.yaml", client)
+        assert updated_app["uid"] == uid
+        assert updated_app["id"] == "app_get_data"
+        assert updated_app["namespace"] == "company.team"
+    finally:
+        await client.call_tool("manage_apps", {"action": "delete", "uid": other_uid})
 
     # Test case 2: Disable the app
     result = await client.call_tool(
@@ -907,6 +924,260 @@ async def test_configuration(kestra_client):
     assert "outputsInInternalStorageEnabled" in response_json and isinstance(
         response_json["outputsInInternalStorageEnabled"], bool
     )
+
+
+_APP_YAML = """id: app_get_data
+type: io.kestra.plugin.ee.apps.Execution
+displayName: Form to request and download data
+namespace: company.team
+flowId: get_data
+"""
+
+
+@pytest.mark.asyncio
+async def test_manage_apps_update_uses_v2_filters_and_matches_exact_app(monkeypatch):
+    """On Kestra 2.x, flat query params (q, namespace, flowId) are ignored by
+    GET /apps/search, which then returns every app in the tenant. Updating an
+    existing app through manage_apps(action='create') must send 2.x filter
+    params and PUT to the exact (namespace, id) match rather than results[0]."""
+    monkeypatch.delenv("KESTRA_API_VERSION", raising=False)
+    search_queries: list[dict[str, str]] = []
+    put_paths: list[str] = []
+
+    all_apps = [
+        {
+            "uid": "uid-unrelated-first",
+            "id": "other_app",
+            "namespace": "other.ns",
+            "flowId": "other_flow",
+        },
+        {
+            "uid": "uid-prefix-ns",
+            "id": "app_get_data",
+            "namespace": "company.team.sub",
+            "flowId": "get_data",
+        },
+        {
+            "uid": "uid-substring-id",
+            "id": "app_get_data_v2",
+            "namespace": "company.team",
+            "flowId": "get_data",
+        },
+        {
+            "uid": "uid-exact-target",
+            "id": "app_get_data",
+            "namespace": "company.team",
+            "flowId": "get_data",
+        },
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/configs"):
+            return httpx.Response(200, json={"version": "2.0.6", "edition": "EE"})
+        if path.endswith("/apps") and request.method == "POST":
+            return httpx.Response(409, json={"message": "App already exists"})
+        if path.endswith("/apps/search") and request.method == "GET":
+            params = dict(request.url.params)
+            search_queries.append(params)
+            # Kestra 2.x ignores flat params and only applies filters[...][...]
+            results = list(all_apps)
+            if ns_eq := params.get("filters[namespace][EQUALS]"):
+                results = [a for a in results if a["namespace"] == ns_eq]
+            if flow_eq := params.get("filters[flowId][EQUALS]"):
+                results = [a for a in results if a["flowId"] == flow_eq]
+            if q_eq := params.get("filters[q][EQUALS]"):
+                results = [a for a in results if q_eq in a["id"]]
+            return httpx.Response(200, json={"results": results, "total": len(results)})
+        if "/apps/" in path and request.method == "PUT":
+            put_paths.append(path)
+            uid = path.rsplit("/", 1)[-1]
+            matched = next((a for a in all_apps if a["uid"] == uid), {"uid": uid})
+            return httpx.Response(200, json={**matched, "updated": True})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        base_url="http://kestra/api/v1/demo", transport=httpx.MockTransport(handler)
+    ) as http:
+        mcp = FastMCP("test")
+        register_ee_tools(mcp, http)
+        async with Client(mcp) as client:
+            result = await client.call_tool(
+                "manage_apps", {"action": "create", "yaml_source": _APP_YAML}
+            )
+
+    response = json.loads(result.content[0].text)
+    assert len(search_queries) == 1
+    sent_params = search_queries[0]
+    assert sent_params == {
+        "filters[q][EQUALS]": "app_get_data",
+        "filters[namespace][EQUALS]": "company.team",
+        "filters[flowId][EQUALS]": "get_data",
+    }
+    assert put_paths == ["/api/v1/demo/apps/uid-exact-target"]
+    assert response["uid"] == "uid-exact-target"
+
+
+@pytest.mark.asyncio
+async def test_manage_apps_update_on_v1_narrows_substring_and_prefix_matches(monkeypatch):
+    """On Kestra 1.x, `q` is a full-text substring match and `namespace` is a
+    prefix match, so `/apps/search` can return `app_get_data_v2` or an app in
+    `company.team.sub` before the exact `(company.team, app_get_data)` app."""
+    monkeypatch.delenv("KESTRA_API_VERSION", raising=False)
+    search_queries: list[dict[str, str]] = []
+    put_paths: list[str] = []
+
+    v1_search_results = [
+        {
+            "uid": "uid-v1-substring",
+            "id": "app_get_data_v2",
+            "namespace": "company.team",
+            "flowId": "get_data",
+        },
+        {
+            "uid": "uid-v1-child-ns",
+            "id": "app_get_data",
+            "namespace": "company.team.analytics",
+            "flowId": "get_data",
+        },
+        {
+            "uid": "uid-v1-exact",
+            "id": "app_get_data",
+            "namespace": "company.team",
+            "flowId": "get_data",
+        },
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/configs"):
+            return httpx.Response(200, json={"version": "1.3.43", "edition": "EE"})
+        if path.endswith("/apps") and request.method == "POST":
+            return httpx.Response(422, json={"message": "Already exists"})
+        if path.endswith("/apps/search") and request.method == "GET":
+            search_queries.append(dict(request.url.params))
+            return httpx.Response(
+                200,
+                json={"results": v1_search_results, "total": len(v1_search_results)},
+            )
+        if "/apps/" in path and request.method == "PUT":
+            put_paths.append(path)
+            return httpx.Response(200, json=v1_search_results[2])
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        base_url="http://kestra/api/v1/demo", transport=httpx.MockTransport(handler)
+    ) as http:
+        mcp = FastMCP("test")
+        register_ee_tools(mcp, http)
+        async with Client(mcp) as client:
+            result = await client.call_tool(
+                "manage_apps", {"action": "create", "yaml_source": _APP_YAML}
+            )
+
+    response = json.loads(result.content[0].text)
+    assert search_queries == [
+        {"q": "app_get_data", "namespace": "company.team", "flowId": "get_data"}
+    ]
+    assert put_paths == ["/api/v1/demo/apps/uid-v1-exact"]
+    assert response["uid"] == "uid-v1-exact"
+
+
+@pytest.mark.asyncio
+async def test_manage_apps_update_304_returns_matched_app_not_first_result(monkeypatch):
+    """When PUT /apps/{uid} returns 304 Not Modified, manage_apps must return
+    the matched app entry rather than search_results['results'][0]."""
+    monkeypatch.delenv("KESTRA_API_VERSION", raising=False)
+
+    search_results = [
+        {
+            "uid": "uid-wrong-first",
+            "id": "app_get_data_copy",
+            "namespace": "company.team",
+            "flowId": "get_data",
+        },
+        {
+            "uid": "uid-right-second",
+            "id": "app_get_data",
+            "namespace": "company.team",
+            "flowId": "get_data",
+        },
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/configs"):
+            return httpx.Response(200, json={"version": "2.0.6", "edition": "EE"})
+        if path.endswith("/apps") and request.method == "POST":
+            return httpx.Response(409, json={"message": "Conflict"})
+        if path.endswith("/apps/search") and request.method == "GET":
+            return httpx.Response(200, json={"results": search_results, "total": 2})
+        if "/apps/" in path and request.method == "PUT":
+            return httpx.Response(304)
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        base_url="http://kestra/api/v1/demo", transport=httpx.MockTransport(handler)
+    ) as http:
+        mcp = FastMCP("test")
+        register_ee_tools(mcp, http)
+        async with Client(mcp) as client:
+            result = await client.call_tool(
+                "manage_apps", {"action": "create", "yaml_source": _APP_YAML}
+            )
+
+    response = json.loads(result.content[0].text)
+    assert response["uid"] == "uid-right-second"
+    assert response["id"] == "app_get_data"
+
+
+@pytest.mark.asyncio
+async def test_manage_apps_update_raises_when_only_non_matching_apps_returned(monkeypatch):
+    """If /apps/search returns partial matches but none with the exact
+    (namespace, id), manage_apps must raise ValueError instead of updating
+    results[0]."""
+    monkeypatch.delenv("KESTRA_API_VERSION", raising=False)
+    put_called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal put_called
+        path = request.url.path
+        if path.endswith("/configs"):
+            return httpx.Response(200, json={"version": "2.0.6", "edition": "EE"})
+        if path.endswith("/apps") and request.method == "POST":
+            return httpx.Response(422, json={"message": "Unprocessable"})
+        if path.endswith("/apps/search") and request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "uid": "uid-other",
+                            "id": "app_get_data_other",
+                            "namespace": "company.team",
+                            "flowId": "get_data",
+                        }
+                    ],
+                    "total": 1,
+                },
+            )
+        if "/apps/" in path and request.method == "PUT":
+            put_called = True
+            return httpx.Response(200, json={"uid": "uid-other"})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        base_url="http://kestra/api/v1/demo", transport=httpx.MockTransport(handler)
+    ) as http:
+        mcp = FastMCP("test")
+        register_ee_tools(mcp, http)
+        async with Client(mcp) as client:
+            with pytest.raises(Exception, match="Could not find existing app"):
+                await client.call_tool(
+                    "manage_apps", {"action": "create", "yaml_source": _APP_YAML}
+                )
+
+    assert put_called is False
 
 
 if __name__ == "__main__":
